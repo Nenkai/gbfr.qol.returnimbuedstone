@@ -62,6 +62,9 @@ public unsafe class Mod : ModBase // <= Do not Remove.
     private IHook<OnDialogEventDelegate> _blacksmithDialogHook;
     public delegate void OnDialogEventDelegate(byte* a1, uint dialogId); // Should be BlacksmithPendulumDialog
 
+    private IHook<GeneratePendulumDataDelegate> _generatePendulumData;
+    public delegate void GeneratePendulumDataDelegate(byte* a1, PendulumData* pPendulumData);
+
     private IHook<SelectPendulumSkillDelegate> _selectPendulumSkillHook;
     public delegate int* SelectPendulumSkillDelegate(byte* a1, uint* retSkill, int* a3);
 
@@ -83,6 +86,10 @@ public unsafe class Mod : ModBase // <= Do not Remove.
             return;
         }
 
+#if DEBUG
+        Debugger.Launch();
+#endif
+
         _imageBase = Process.GetCurrentProcess().MainModule!.BaseAddress;
         var memory = Reloaded.Memory.Memory.Instance;
 
@@ -100,6 +107,14 @@ public unsafe class Mod : ModBase // <= Do not Remove.
             _logger.WriteLine($"[gbfr.qol.returnimbuedstone] Successfully hooked ui::Component::ControllerBlackSmithPendulumDialog::OnDialogEvent", _logger.ColorGreen);
         });
 
+        // Hook the function responsible for generating pendulum data
+        SigScan("55 41 57 41 56 41 55 41 54 56 57 53 48 83 EC ?? 48 8D 6C 24 ?? 48 C7 45 ?? ?? ?? ?? ?? 49 89 D6 8B 52", "", address =>
+        {
+            _generatePendulumData = _hooks.CreateHook<GeneratePendulumDataDelegate>(GeneratePendulumData, address).Activate();
+            _logger.WriteLine($"[gbfr.qol.returnimbuedstone] Successfully hooked GeneratePendulumData", _logger.ColorGreen);
+        });
+
+        /*
         // Hook function that gets a skill for a pendulum
         SigScan("41 57 41 56 56 57 55 53 48 83 EC ?? 44 89 C3 49 89 CF 44 89 C5", "", address =>
         {
@@ -113,6 +128,7 @@ public unsafe class Mod : ModBase // <= Do not Remove.
             _selectPendulumSkillLevelHook = _hooks.CreateHook<SelectPendulumSkillLevelDelegate>(SelectPendulumSkillLevel, address).Activate();
             _logger.WriteLine($"[gbfr.qol.returnimbuedstone] Successfully hooked SelectPendulumSkillLevel", _logger.ColorGreen);
         });
+        */
     }
 
     private void SigScan(string pattern, string name, Action<nint> action)
@@ -128,7 +144,7 @@ public unsafe class Mod : ModBase // <= Do not Remove.
     }
 
     private bool _givingPendulumBack = false;
-    private WeaponSaveDataUnit _oldWeaponState;
+    private WeaponSaveDataUnit _oldWp;
     private int _traitIdx = 1;
 
     // ui::component::ControllerBlacksmithPendulumDialog::OnDialogEvent
@@ -171,8 +187,8 @@ public unsafe class Mod : ModBase // <= Do not Remove.
             //_logger.WriteLine((*target).ToString());
 
             // Copy the struct containing the old pendulum while we can
-            _oldWeaponState = new WeaponSaveDataUnit();
-            _oldWeaponState = *target;
+            _oldWp = new WeaponSaveDataUnit();
+            _oldWp = *target;
         }
 
         // Let the original function do its thing, the data unit will be changed with the new pendulum
@@ -185,23 +201,33 @@ public unsafe class Mod : ModBase // <= Do not Remove.
             //_logger.WriteLine((*target).ToString());
 
             // Old weapon has a pendulum?
-            if (_oldWeaponState.PendulumItemId != XXHash32Custom.Hash(string.Empty))
+            if (_oldWp.PendulumData.PendulumItemId != XXHash32Custom.Hash(string.Empty))
             {
                 byte* itemGlobal = (byte*)*(long*)(_imageBase + 0x68bf3c0);
 
                 _traitIdx = 1;
 
                 _givingPendulumBack = true;
-                Wrapper_AddPendulum(itemGlobal, _oldWeaponState.PendulumItemId, false);
+                Wrapper_AddPendulum(itemGlobal, _oldWp.PendulumData.PendulumItemId, false);
                 _givingPendulumBack = false;
 
-                _logger.WriteLine($"[gbfr.qol.returnimbuedstone] Stone {_oldWeaponState.PendulumItemId:X8} ({_oldWeaponState.Skill1:X8}/{_oldWeaponState.Skill2:X8}/{_oldWeaponState.Skill3:X8}, " +
-                    $"Lv{_oldWeaponState.Skill1Level}/{_oldWeaponState.Skill2Level}/{_oldWeaponState.Skill3Level}) " +
-                    $"for Weapon {_oldWeaponState.WeaponId:X8} (+{_oldWeaponState.MirageCount}, {_oldWeaponState.UncapTier}* Uncap) added back to inventory.");
+                _logger.WriteLine($"[gbfr.qol.returnimbuedstone] Stone {_oldWp.PendulumData.PendulumItemId:X8} ({_oldWp.PendulumData.Skill1:X8}/{_oldWp.PendulumData.Skill2:X8}/{_oldWp.PendulumData.Skill3:X8}, " +
+                    $"Lv{_oldWp.PendulumData.Skill1Level}/{_oldWp.PendulumData.Skill2Level}/{_oldWp.PendulumData.Skill3Level}) " +
+                    $"for Weapon {_oldWp.WeaponId:X8} (+{_oldWp.MirageCount}, {_oldWp.UncapTier}* Uncap) added back to inventory.");
             }
         }
     }
 
+    public void GeneratePendulumData(byte* a1, PendulumData* pPendulumData)
+    {
+        // This function solely just generates pendulum data into the second argument
+        if (_givingPendulumBack)
+            *pPendulumData = _oldWp.PendulumData; // We are giving back the stone, instead of generating, just set the old stats right away
+        else
+            _generatePendulumData.OriginalFunction(a1, pPendulumData);
+    }
+
+    /*
     /// <summary>
     /// Fired when a skill for a pendulum needs to be selected
     /// </summary>
@@ -248,37 +274,8 @@ public unsafe class Mod : ModBase // <= Do not Remove.
         else
             return _selectPendulumSkillLevelHook.OriginalFunction(a1, a2, a3);
     }
+    */
 
-    struct WeaponSaveDataUnit
-    {
-        public int SaveSlotIDMaybe;
-        public int WeaponId;
-        public int field_8;
-        public int field_C;
-        public int XP;
-        public int UncapTier;
-        public int MirageCount;
-        public int field_1C;
-        public uint Skill1;
-        public uint Skill1Level;
-        public uint Skill2;
-        public uint Skill2Level;
-        public uint Skill3;
-        public uint Skill3Level;
-        public uint PendulumItemId;
-
-        public override readonly string ToString()
-        {
-            return $"- Slot ID: {SaveSlotIDMaybe}\n" +
-                   $"- Weapon ID: {WeaponId:X8}\n" +
-                   $"- Trait 1: {Skill1:X8} (Lv{Skill1Level})\n" +
-                   $"- Trait 2: {Skill2:X8} (Lv{Skill2Level})\n" +
-                   $"- Trait 3: {Skill3:X8} (Lv{Skill3Level})\n" +
-                   $"- Mirage: {MirageCount}\n" +
-                   $"- Uncap Tier: {UncapTier}\n" +
-                   $"- Stone ID: {PendulumItemId:X8}";
-        }
-    };
 
     #region Standard Overrides
     public override void ConfigurationUpdated(Config configuration)
