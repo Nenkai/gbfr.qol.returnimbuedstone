@@ -1,18 +1,14 @@
-﻿using gbfr.qol.returnimbuedstone.Configuration;
-using gbfr.qol.returnimbuedstone.Template;
+﻿using System.Diagnostics;
 
-using Reloaded.Hooks.ReloadedII.Interfaces;
 using Reloaded.Mod.Interfaces;
-
-using System.Diagnostics;
-
 using Reloaded.Hooks.Definitions;
-using Reloaded.Memory.Interfaces;
+using Reloaded.Memory.Sigscan;
+using Reloaded.Memory.Sigscan.Definitions.Structs;
 using Reloaded.Memory.SigScan.ReloadedII.Interfaces;
 using IReloadedHooks = Reloaded.Hooks.ReloadedII.Interfaces.IReloadedHooks;
-using System;
-using Reloaded.Hooks.Definitions.Structs;
-using System.Runtime.CompilerServices;
+
+using gbfr.qol.returnimbuedstone.Configuration;
+using gbfr.qol.returnimbuedstone.Template;
 
 namespace gbfr.qol.returnimbuedstone;
 
@@ -56,6 +52,10 @@ public unsafe class Mod : ModBase // <= Do not Remove.
 
     private nint _imageBase;
 
+    private byte* _global1ExeAddr;
+    private byte* _itemManagerGlobal; // This will be fetched from hooking the give item function
+    private byte* _saveDataGlobalExeAddr;
+
     private GivePendulumDelegate Wrapper_AddPendulum;
     public unsafe delegate void GivePendulumDelegate(byte* itemGlobal, uint pendulumItemId, bool flag);
 
@@ -63,13 +63,10 @@ public unsafe class Mod : ModBase // <= Do not Remove.
     public delegate void OnDialogEventDelegate(byte* a1, uint dialogId); // Should be BlacksmithPendulumDialog
 
     private IHook<GeneratePendulumDataDelegate> _generatePendulumData;
-    public delegate void GeneratePendulumDataDelegate(byte* a1, PendulumData* pPendulumData);
+    public delegate void GeneratePendulumDataDelegate(byte* this_, PendulumData* pPendulumData);
 
-    private IHook<SelectPendulumSkillDelegate> _selectPendulumSkillHook;
-    public delegate int* SelectPendulumSkillDelegate(byte* a1, uint* retSkill, int* a3);
-
-    private IHook<SelectPendulumSkillLevelDelegate> _selectPendulumSkillLevelHook;
-    public delegate uint SelectPendulumSkillLevelDelegate(byte* a1, uint a2, uint a3);
+    private IHook<OnGiveItemDelegate> _giveItemHook;
+    public unsafe delegate void OnGiveItemDelegate(byte* a1, uint itemIdHash, uint count, bool flag);
 
     public Mod(ModContext context)
     {
@@ -86,9 +83,7 @@ public unsafe class Mod : ModBase // <= Do not Remove.
             return;
         }
 
-#if DEBUG
         Debugger.Launch();
-#endif
 
         _imageBase = Process.GetCurrentProcess().MainModule!.BaseAddress;
         var memory = Reloaded.Memory.Memory.Instance;
@@ -103,15 +98,22 @@ public unsafe class Mod : ModBase // <= Do not Remove.
         // Hook the dialog result when imbuing
         SigScan("55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC ?? ?? ?? ?? 48 8D AC 24 ?? ?? ?? ?? 48 83 E4 ?? 48 89 E3 48 89 AB ?? ?? ?? ?? 48 C7 85 ?? ?? ?? ?? ?? ?? ?? ?? 48 89 CE 48 8B 05", "", address =>
         {
-            _blacksmithDialogHook = _hooks.CreateHook<OnDialogEventDelegate>(ui__Component__ControllerBlackSmithPendulumDialog__OnDialogEvent, address).Activate();
-            _logger.WriteLine($"[gbfr.qol.returnimbuedstone] Successfully hooked ui::Component::ControllerBlackSmithPendulumDialog::OnDialogEvent", _logger.ColorGreen);
+            _blacksmithDialogHook = _hooks.CreateHook<OnDialogEventDelegate>(ui__Component__ControllerBlackSmithPendulumDialog__OnDialogEvent_Hook, address).Activate();
+            _logger.WriteLine($"[gbfr.qol.returnimbuedstone] Successfully hooked ui::Component::ControllerBlackSmithPendulumDialog::OnDialogEvent (0x{address:X8})", _logger.ColorGreen);
         });
 
         // Hook the function responsible for generating pendulum data
         SigScan("55 41 57 41 56 41 55 41 54 56 57 53 48 83 EC ?? 48 8D 6C 24 ?? 48 C7 45 ?? ?? ?? ?? ?? 49 89 D6 8B 52", "", address =>
         {
-            _generatePendulumData = _hooks.CreateHook<GeneratePendulumDataDelegate>(GeneratePendulumData, address).Activate();
-            _logger.WriteLine($"[gbfr.qol.returnimbuedstone] Successfully hooked GeneratePendulumData", _logger.ColorGreen);
+            _generatePendulumData = _hooks.CreateHook<GeneratePendulumDataDelegate>(GeneratePendulumData_Hook, address).Activate();
+            _logger.WriteLine($"[gbfr.qol.returnimbuedstone] Successfully hooked GeneratePendulumData (0x{address:X8})", _logger.ColorGreen);
+        });
+
+        SigScan("55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC ?? ?? ?? ?? 48 8D AC 24 ?? ?? ?? ?? " +
+                "48 83 E4 ?? 48 89 E3 48 89 AB ?? ?? ?? ?? 48 C7 85 ?? ?? ?? ?? ?? ?? ?? ?? 45 85 C0 0F 84", "", address =>
+        {
+            _giveItemHook = _hooks!.CreateHook<OnGiveItemDelegate>(OnGiveItem_Hook, address).Activate();
+            _logger.WriteLine($"[gbfr.qol.returnimbuedstone] Successfully hooked OnGiveItem (0x{address:X8})", _logger.ColorGreen);
         });
 
         /*
@@ -145,70 +147,64 @@ public unsafe class Mod : ModBase // <= Do not Remove.
 
     private bool _givingPendulumBack = false;
     private WeaponSaveDataUnit _oldWp;
-    private int _traitIdx = 1;
 
     // ui::component::ControllerBlacksmithPendulumDialog::OnDialogEvent
-    private void ui__Component__ControllerBlackSmithPendulumDialog__OnDialogEvent(byte* a1, uint dialogId)
+    private void ui__Component__ControllerBlackSmithPendulumDialog__OnDialogEvent_Hook(byte* this_, uint dialogId)
     {
         // 3FCF6BB6|BlacksmithPendulumDialog
         // E261AA72|BlacksmithPendulumResultDialog <-- we want this one - this is the screen when imbuing is actually being performed
         if (dialogId != 0xE261AA72)
         {
-            _blacksmithDialogHook.OriginalFunction(a1, dialogId);
+            _blacksmithDialogHook.OriginalFunction(this_, dialogId);
             return;
         }
 
 
-        WeaponSaveDataUnit* target = null;
-        if (*(a1 + 0x240) == 1) // Pressed OK? otherwise 0 is cancel
+        WeaponSaveDataUnit* pCurrentWeapon = null;
+
+        // if (*(a1 + 0x240) == 1) // Pressed OK? otherwise 0 is cancel
+        // ^ check removed, this is never 0 anyway since the only option is OK
+
+        int weaponSlotId = *(int*)((byte*)*(long*)_global1ExeAddr + 0xD4);
+
+        for (int characterIndex = 0; characterIndex < 32; characterIndex++) // Each character?
         {
-            byte* unkGlobal1 = (byte*)*(long*)(_imageBase + 0x68BF3A0);
-            byte* saveDataGlobal = (byte*)*(long*)(_imageBase + 0x68BF3F0);
-            int weaponSlotId = *(int*)(unkGlobal1 + 0xD4);
-
-            for (int i = 0; i < 32; i++) // Each character?
+            for (int weaponIndex = 0; weaponIndex < 8; weaponIndex++) // Each weapon?
             {
-                for (int j = 0; j < 8; j++) // Each weapon?
+                WeaponSaveDataUnit* pWeapon = (WeaponSaveDataUnit*)((byte*)*(long*)_saveDataGlobalExeAddr + (characterIndex * 0x500) + (0x1B0 + (weaponIndex * 0xA0)));
+                if (pWeapon->SaveSlotIDMaybe == weaponSlotId)
                 {
-                    WeaponSaveDataUnit* ptr = (WeaponSaveDataUnit*)(saveDataGlobal + (i * 0x500) + (0x1B0 + (j * 0xA0)));
-                    if (ptr->SaveSlotIDMaybe == weaponSlotId)
-                    {
-                        target = ptr;
-                        break;
-                    }
-                }
-
-                if (target is not null)
+                    pCurrentWeapon = pWeapon;
                     break;
+                }
             }
 
-            //_logger.WriteLine($"Weapon Slot Address: {(long)target:X8}");
-            //_logger.WriteLine("=== OLD ===");
-            //_logger.WriteLine((*target).ToString());
-
-            // Copy the struct containing the old pendulum while we can
-            _oldWp = new WeaponSaveDataUnit();
-            _oldWp = *target;
+            if (pCurrentWeapon is not null)
+                break;
         }
 
+        //_logger.WriteLine($"=== OLD ===\n{(*target).ToString()}");
+
+        // Copy the struct containing the old pendulum while we can
+        _oldWp = new WeaponSaveDataUnit();
+        _oldWp = *pCurrentWeapon;
+
+
         // Let the original function do its thing, the data unit will be changed with the new pendulum
-        _blacksmithDialogHook.OriginalFunction(a1, dialogId);
+        _blacksmithDialogHook.OriginalFunction(this_, dialogId);
 
         // Original function has likely altered the pendulum now, so add the old one back to the inventory
-        if (target is not null)
+        if (pCurrentWeapon is not null)
         {
-            //_logger.WriteLine("=== NEW ===");
-            //_logger.WriteLine((*target).ToString());
+            //_logger.WriteLine($"=== NEW ===\n{(*target).ToString()}");
 
             // Old weapon has a pendulum?
             if (_oldWp.PendulumData.PendulumItemId != XXHash32Custom.Hash(string.Empty))
             {
-                byte* itemGlobal = (byte*)*(long*)(_imageBase + 0x68bf3c0);
-
-                _traitIdx = 1;
+                //_traitIdx = 1;
 
                 _givingPendulumBack = true;
-                Wrapper_AddPendulum(itemGlobal, _oldWp.PendulumData.PendulumItemId, false);
+                Wrapper_AddPendulum(_itemManagerGlobal, _oldWp.PendulumData.PendulumItemId, false);
                 _givingPendulumBack = false;
 
                 _logger.WriteLine($"[gbfr.qol.returnimbuedstone] Stone {_oldWp.PendulumData.PendulumItemId:X8} ({_oldWp.PendulumData.Skill1:X8}/{_oldWp.PendulumData.Skill2:X8}/{_oldWp.PendulumData.Skill3:X8}, " +
@@ -218,7 +214,7 @@ public unsafe class Mod : ModBase // <= Do not Remove.
         }
     }
 
-    public void GeneratePendulumData(byte* a1, PendulumData* pPendulumData)
+    public void GeneratePendulumData_Hook(byte* a1, PendulumData* pPendulumData)
     {
         // This function solely just generates pendulum data into the second argument
         if (_givingPendulumBack)
@@ -227,7 +223,71 @@ public unsafe class Mod : ModBase // <= Do not Remove.
             _generatePendulumData.OriginalFunction(a1, pPendulumData);
     }
 
-    /*
+    public unsafe void OnGiveItem_Hook(byte* a1, uint itemId, uint count, bool flag)
+    {
+        if (_itemManagerGlobal is null)
+        {
+            _itemManagerGlobal = a1;
+
+            Process thisProcess = Process.GetCurrentProcess();
+            nint baseAddress = thisProcess.MainModule!.BaseAddress;
+            int exeSize = thisProcess.MainModule.ModuleMemorySize;
+
+            // Search for executable reference of said pointer so we can find the other globals
+            using (var scanner = new Scanner((byte*)baseAddress, exeSize))
+            {
+                string pattern = string.Join(" ", BitConverter.GetBytes((long)a1).Select(e => e.ToString("X2")));
+
+                // This is in a loop as first match is the wrong match
+                byte* itemManagerGlobalExeAddr;
+                PatternScanResult result = default;
+                do
+                {
+                    result = scanner.FindPattern(pattern, result.Offset + 1);
+                    itemManagerGlobalExeAddr = (byte*)(thisProcess.MainModule.BaseAddress + result.Offset);
+
+                    // first match is usually incorrect, try heuristic
+                    if (*(long*)(itemManagerGlobalExeAddr + 0x10) != 0 &&
+                        *(long*)(itemManagerGlobalExeAddr - 0x20) == 0 && *(long*)(itemManagerGlobalExeAddr + 0x30) != 0) // First global at -0x20 is usually 0 when this function is first hit
+                        break;
+
+                } while (true);
+
+                _global1ExeAddr = itemManagerGlobalExeAddr - 0x20;
+                _saveDataGlobalExeAddr = itemManagerGlobalExeAddr + 0x30;
+            }
+        }
+
+        _giveItemHook.OriginalFunction(a1, itemId, count, flag);
+    }
+
+    #region Standard Overrides
+    public override void ConfigurationUpdated(Config configuration)
+    {
+        // Apply settings from configuration.
+        // ... your code here.
+        _configuration = configuration;
+        _logger.WriteLine($"[{_modConfig.ModId}] Config Updated: Applying");
+    }
+    #endregion
+
+    #region For Exports, Serialization etc.
+#pragma warning disable CS8618 // Non-nullable field must contain a non-null value when exiting constructor. Consider declaring as nullable.
+    public Mod() { }
+#pragma warning restore CS8618
+    #endregion
+
+
+    /* OLD METHOD (didn't work for main stone trait)
+    
+    private int _traitIdx = 1;
+
+    private IHook<SelectPendulumSkillDelegate> _selectPendulumSkillHook;
+    public delegate int* SelectPendulumSkillDelegate(byte* a1, uint* retSkill, int* a3);
+
+    private IHook<SelectPendulumSkillLevelDelegate> _selectPendulumSkillLevelHook;
+    public delegate uint SelectPendulumSkillLevelDelegate(byte* a1, uint a2, uint a3);
+
     /// <summary>
     /// Fired when a skill for a pendulum needs to be selected
     /// </summary>
@@ -275,21 +335,4 @@ public unsafe class Mod : ModBase // <= Do not Remove.
             return _selectPendulumSkillLevelHook.OriginalFunction(a1, a2, a3);
     }
     */
-
-
-    #region Standard Overrides
-    public override void ConfigurationUpdated(Config configuration)
-    {
-        // Apply settings from configuration.
-        // ... your code here.
-        _configuration = configuration;
-        _logger.WriteLine($"[{_modConfig.ModId}] Config Updated: Applying");
-    }
-    #endregion
-
-    #region For Exports, Serialization etc.
-#pragma warning disable CS8618 // Non-nullable field must contain a non-null value when exiting constructor. Consider declaring as nullable.
-    public Mod() { }
-#pragma warning restore CS8618
-    #endregion
 }
