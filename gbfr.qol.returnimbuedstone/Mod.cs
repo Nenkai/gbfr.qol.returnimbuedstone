@@ -1,14 +1,20 @@
-﻿using System.Diagnostics;
+﻿using gbfr.qol.returnimbuedstone.Configuration;
+using gbfr.qol.returnimbuedstone.Template;
 
-using Reloaded.Mod.Interfaces;
+using gbfrelink.utility.manager.Interfaces;
+
+using NenTools.Reloaded.ScanManager.Interfaces;
+
 using Reloaded.Hooks.Definitions;
 using Reloaded.Memory.Sigscan;
 using Reloaded.Memory.Sigscan.Definitions.Structs;
 using Reloaded.Memory.SigScan.ReloadedII.Interfaces;
-using IReloadedHooks = Reloaded.Hooks.ReloadedII.Interfaces.IReloadedHooks;
+using Reloaded.Mod.Interfaces;
 
-using gbfr.qol.returnimbuedstone.Configuration;
-using gbfr.qol.returnimbuedstone.Template;
+using System.Diagnostics;
+using System.Net;
+
+using IReloadedHooks = Reloaded.Hooks.ReloadedII.Interfaces.IReloadedHooks;
 
 namespace gbfr.qol.returnimbuedstone;
 
@@ -50,23 +56,23 @@ public unsafe class Mod : ModBase // <= Do not Remove.
 
     private static IStartupScanner? _startupScanner = null!;
 
-    private nint _imageBase;
+    private readonly IUserDefinedParams? _userDefinedParams;
 
-    private byte* _global1ExeAddr;
     private byte* _itemManagerGlobal; // This will be fetched from hooking the give item function
-    private byte* _saveDataGlobalExeAddr;
+    private nint _weaponManagerPtr;
+    private nint _currentCharacterStatePtr;
 
     private GivePendulumDelegate Wrapper_AddPendulum;
-    public unsafe delegate void GivePendulumDelegate(byte* itemGlobal, uint pendulumItemId, bool flag);
+    public delegate void GivePendulumDelegate(byte* itemGlobal, uint pendulumItemId, bool flag);
 
     private IHook<OnDialogEventDelegate> _blacksmithDialogHook;
-    public delegate void OnDialogEventDelegate(byte* a1, uint dialogId); // Should be BlacksmithPendulumDialog
+    public delegate void OnDialogEventDelegate(byte* a1); // Should be BlacksmithPendulumDialog
 
     private IHook<GeneratePendulumDataDelegate> _generatePendulumData;
     public delegate void GeneratePendulumDataDelegate(byte* this_, PendulumData* pPendulumData);
 
     private IHook<OnGiveItemDelegate> _giveItemHook;
-    public unsafe delegate void OnGiveItemDelegate(byte* a1, uint itemIdHash, uint count, bool flag);
+    public delegate void OnGiveItemDelegate(byte* a1, uint itemIdHash, uint count, bool flag);
 
     public Mod(ModContext context)
     {
@@ -77,44 +83,55 @@ public unsafe class Mod : ModBase // <= Do not Remove.
         _configuration = context.Configuration;
         _modConfig = context.ModConfig;
 
+#if DEBUG
+        Debugger.Launch();
+#endif
+
         var startupScannerController = _modLoader.GetController<IStartupScanner>();
         if (startupScannerController == null || !startupScannerController.TryGetTarget(out _startupScanner))
         {
+            _logger.WriteLine($"[{_modConfig.ModId}] IStartupScanner not found?", System.Drawing.Color.Red);
             return;
         }
 
-        Debugger.Launch();
-
-        _imageBase = Process.GetCurrentProcess().MainModule!.BaseAddress;
-        var memory = Reloaded.Memory.Memory.Instance;
-
-        // Get function that gives pendulums
-        SigScan("55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC ?? ?? ?? ?? 48 8D AC 24 ?? ?? ?? ?? 48 C7 45 ?? ?? ?? ?? ?? 45 89 C6 89 D7 48 89 CE", "", address =>
+        var userDefinedParamsRef = _modLoader.GetController<IUserDefinedParams>();
+        if (startupScannerController == null || !userDefinedParamsRef.TryGetTarget(out _userDefinedParams))
         {
-            Wrapper_AddPendulum = _hooks!.CreateWrapper<GivePendulumDelegate>(address, out nint wrapperAddress);
-            _logger.WriteLine($"[gbfr.qol.returnimbuedstone] Registered GiveStoneItem (0x{address:X8})", _logger.ColorGreen);
-        });
+            _logger.WriteLine($"[{_modConfig.ModId}] IUserDefinedParams not found?", System.Drawing.Color.Red);
+            return;
+        }
+
+        var scanManagerRef = _modLoader.GetController<IScanManager>();
+        if (startupScannerController == null || !scanManagerRef.TryGetTarget(out IScanManager? scanManager))
+        {
+            _logger.WriteLine($"[{_modConfig.ModId}] IScanManager not found?", System.Drawing.Color.Red);
+            return;
+        }
+
+        string signaturesFolder = Path.Combine(_modLoader.GetDirectoryForModId(_modConfig.ModId), "Signatures");
+        scanManager.InitializeScans(signaturesFolder, _modConfig.ModId);
+
+        string sourceGroup = _userDefinedParams.IsEndlessRagnarok() ? "granblue_fantasy_relink_er" : "granblue_fantasy_relink";
+
+        scanManager.AddScan("GiveStoneItem", sourceGroup, (addr) =>
+            Wrapper_AddPendulum = _hooks!.CreateWrapper<GivePendulumDelegate>(addr, out nint wrapperAddress));
 
         // Hook the dialog result when imbuing
-        SigScan("55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC ?? ?? ?? ?? 48 8D AC 24 ?? ?? ?? ?? 48 83 E4 ?? 48 89 E3 48 89 AB ?? ?? ?? ?? 48 C7 85 ?? ?? ?? ?? ?? ?? ?? ?? 48 89 CE 48 8B 05", "", address =>
-        {
-            _blacksmithDialogHook = _hooks.CreateHook<OnDialogEventDelegate>(ui__Component__ControllerBlackSmithPendulumDialog__OnDialogEvent_Hook, address).Activate();
-            _logger.WriteLine($"[gbfr.qol.returnimbuedstone] Successfully hooked ui::Component::ControllerBlackSmithPendulumDialog::OnDialogEvent (0x{address:X8})", _logger.ColorGreen);
-        });
+        scanManager.AddScan("ui_Component_ControllerBlackSmithPendulumDialog_OnDialogEvent", sourceGroup, (addr) =>
+            _blacksmithDialogHook = _hooks.CreateHook<OnDialogEventDelegate>(ui__Component__ControllerBlackSmithPendulumDialog__OnDialogEvent_Hook, addr).Activate());
 
         // Hook the function responsible for generating pendulum data
-        SigScan("55 41 57 41 56 41 55 41 54 56 57 53 48 83 EC ?? 48 8D 6C 24 ?? 48 C7 45 ?? ?? ?? ?? ?? 49 89 D6 8B 52", "", address =>
-        {
-            _generatePendulumData = _hooks.CreateHook<GeneratePendulumDataDelegate>(GeneratePendulumData_Hook, address).Activate();
-            _logger.WriteLine($"[gbfr.qol.returnimbuedstone] Successfully hooked GeneratePendulumData (0x{address:X8})", _logger.ColorGreen);
-        });
+        scanManager.AddScan("GeneratePendulumData", sourceGroup, (addr) =>
+            _generatePendulumData = _hooks.CreateHook<GeneratePendulumDataDelegate>(GeneratePendulumData_Hook, addr).Activate());
 
-        SigScan("55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC ?? ?? ?? ?? 48 8D AC 24 ?? ?? ?? ?? " +
-                "48 83 E4 ?? 48 89 E3 48 89 AB ?? ?? ?? ?? 48 C7 85 ?? ?? ?? ?? ?? ?? ?? ?? 45 85 C0 0F 84", "", address =>
-        {
-            _giveItemHook = _hooks!.CreateHook<OnGiveItemDelegate>(OnGiveItem_Hook, address).Activate();
-            _logger.WriteLine($"[gbfr.qol.returnimbuedstone] Successfully hooked OnGiveItem (0x{address:X8})", _logger.ColorGreen);
-        });
+        scanManager.AddScan("WeaponManager_Ptr", sourceGroup, (addr) =>
+            _weaponManagerPtr = addr + (*(int*)(addr + 3)) + 7);
+
+        scanManager.AddScan("CurrentCharacterState_Ptr", sourceGroup, (addr) =>
+            _currentCharacterStatePtr = addr + (*(int*)(addr + 3)) + 7);
+
+        scanManager.AddScan("ItemManager_OnGiveItem", sourceGroup, (addr) =>
+            _giveItemHook = _hooks!.CreateHook<OnGiveItemDelegate>(ItemManager_OnGiveItem_Hook, addr).Activate());
 
         /*
         // Hook function that gets a skill for a pendulum
@@ -133,45 +150,38 @@ public unsafe class Mod : ModBase // <= Do not Remove.
         */
     }
 
-    private void SigScan(string pattern, string name, Action<nint> action)
-    {
-        _startupScanner?.AddMainModuleScan(pattern, result =>
-        {
-            if (!result.Found)
-            {
-                return;
-            }
-            action(_imageBase + result.Offset);
-        });
-    }
-
     private bool _givingPendulumBack = false;
     private WeaponSaveDataUnit _oldWp;
 
     // ui::component::ControllerBlacksmithPendulumDialog::OnDialogEvent
-    private void ui__Component__ControllerBlackSmithPendulumDialog__OnDialogEvent_Hook(byte* this_, uint dialogId)
+    private void ui__Component__ControllerBlackSmithPendulumDialog__OnDialogEvent_Hook(byte* this_)
     {
         // 3FCF6BB6|BlacksmithPendulumDialog
         // E261AA72|BlacksmithPendulumResultDialog <-- we want this one - this is the screen when imbuing is actually being performed
-        if (dialogId != 0xE261AA72)
+        if (*(this_ + 0x240) == 0) // There's two dialogs. 0 = confirm, 1 = actually perform it
         {
-            _blacksmithDialogHook.OriginalFunction(this_, dialogId);
+            _blacksmithDialogHook.OriginalFunction(this_);
             return;
         }
-
-
-        WeaponSaveDataUnit* pCurrentWeapon = null;
 
         // if (*(a1 + 0x240) == 1) // Pressed OK? otherwise 0 is cancel
         // ^ check removed, this is never 0 anyway since the only option is OK
 
-        int weaponSlotId = *(int*)((byte*)*(long*)_global1ExeAddr + 0xD4);
+        WeaponSaveDataUnit* pCurrentWeapon = null;
+        int saveDataAddr = _userDefinedParams.IsEndlessRagnarok () ? 0x370 : 0x1B0;
+        int charaSize = _userDefinedParams.IsEndlessRagnarok() ? 0x680 : 0x500;
+        int weaponSize = _userDefinedParams.IsEndlessRagnarok() ? 0xD0 : 0xA0;
+
+        int weaponSlotId = *(int*)((*(nint*)_currentCharacterStatePtr) + 0xD4);
 
         for (int characterIndex = 0; characterIndex < 32; characterIndex++) // Each character?
         {
             for (int weaponIndex = 0; weaponIndex < 8; weaponIndex++) // Each weapon?
             {
-                WeaponSaveDataUnit* pWeapon = (WeaponSaveDataUnit*)((byte*)*(long*)_saveDataGlobalExeAddr + (characterIndex * 0x500) + (0x1B0 + (weaponIndex * 0xA0)));
+                WeaponSaveDataUnit* pWeapon = (WeaponSaveDataUnit*)((byte*)*(long*)_weaponManagerPtr + saveDataAddr + 
+                    (characterIndex * charaSize) + 
+                    (weaponIndex * weaponSize));
+
                 if (pWeapon->SaveSlotIDMaybe == weaponSlotId)
                 {
                     pCurrentWeapon = pWeapon;
@@ -183,23 +193,18 @@ public unsafe class Mod : ModBase // <= Do not Remove.
                 break;
         }
 
-        //_logger.WriteLine($"=== OLD ===\n{(*target).ToString()}");
-
         // Copy the struct containing the old pendulum while we can
         _oldWp = new WeaponSaveDataUnit();
         _oldWp = *pCurrentWeapon;
 
-
         // Let the original function do its thing, the data unit will be changed with the new pendulum
-        _blacksmithDialogHook.OriginalFunction(this_, dialogId);
+        _blacksmithDialogHook.OriginalFunction(this_);
 
         // Original function has likely altered the pendulum now, so add the old one back to the inventory
         if (pCurrentWeapon is not null)
         {
-            //_logger.WriteLine($"=== NEW ===\n{(*target).ToString()}");
-
             // Old weapon has a pendulum?
-            if (_oldWp.PendulumData.PendulumItemId != XXHash32Custom.Hash(string.Empty))
+            if (_oldWp.PendulumData.PendulumItemId != XXHash32Custom.Hash(""))
             {
                 //_traitIdx = 1;
 
@@ -223,42 +228,14 @@ public unsafe class Mod : ModBase // <= Do not Remove.
             _generatePendulumData.OriginalFunction(a1, pPendulumData);
     }
 
-    public unsafe void OnGiveItem_Hook(byte* a1, uint itemId, uint count, bool flag)
+    private void ItemManager_OnGiveItem_Hook(byte* @this, uint itemId, uint count, bool flag)
     {
-        if (_itemManagerGlobal is null)
-        {
-            _itemManagerGlobal = a1;
+        // Grab item manager pointer
+        if (_itemManagerGlobal == null)
+            _itemManagerGlobal = @this;
 
-            Process thisProcess = Process.GetCurrentProcess();
-            nint baseAddress = thisProcess.MainModule!.BaseAddress;
-            int exeSize = thisProcess.MainModule.ModuleMemorySize;
-
-            // Search for executable reference of said pointer so we can find the other globals
-            using (var scanner = new Scanner((byte*)baseAddress, exeSize))
-            {
-                string pattern = string.Join(" ", BitConverter.GetBytes((long)a1).Select(e => e.ToString("X2")));
-
-                // This is in a loop as first match is the wrong match
-                byte* itemManagerGlobalExeAddr;
-                PatternScanResult result = default;
-                do
-                {
-                    result = scanner.FindPattern(pattern, result.Offset + 1);
-                    itemManagerGlobalExeAddr = (byte*)(thisProcess.MainModule.BaseAddress + result.Offset);
-
-                    // first match is usually incorrect, try heuristic
-                    if (*(long*)(itemManagerGlobalExeAddr + 0x10) != 0 &&
-                        *(long*)(itemManagerGlobalExeAddr - 0x20) == 0 && *(long*)(itemManagerGlobalExeAddr + 0x30) != 0) // First global at -0x20 is usually 0 when this function is first hit
-                        break;
-
-                } while (true);
-
-                _global1ExeAddr = itemManagerGlobalExeAddr - 0x20;
-                _saveDataGlobalExeAddr = itemManagerGlobalExeAddr + 0x30;
-            }
-        }
-
-        _giveItemHook.OriginalFunction(a1, itemId, count, flag);
+        _giveItemHook.OriginalFunction(@this, itemId, count, flag);
+        _giveItemHook.Disable();
     }
 
     #region Standard Overrides
